@@ -1,7 +1,5 @@
 #! /usr/bin/env python3
 
-# Copyright 2017, Anthony Westbrook <anthony.westbrook@unh.edu>, University of New Hampshire
-
 import array
 import fcntl
 import argparse
@@ -13,10 +11,13 @@ import pty
 import tty
 import termios
 from threading import Thread
+from time import sleep
 
 HOME_STRING = "\x1B[H"
 CURSOROFF_STRING = "\x1B[?25l"
 CURSORON_STRING = "\x1B[?25h"
+
+SUPPORTED_KEYS = "ABEeltm0123<>RHVJcjxyzbq"
 
 def debugEsc(passChunk):
     for c in passChunk: 
@@ -46,32 +47,41 @@ def parseNodes(passRaw):
 
     return retNodes
         
-def getSlurmInfo(passJob):
+def getSlurmHandle(passJob):
     retInfo = dict()
 
-    # Obtain Slurm info
-    command = "squeue -a -o %N\t%P\t%M\t%T -h -j {0}".format(passJob).split(' ')
-    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=False)
-    out, err = process.communicate()
+    while True:
+        # Obtain Slurm info
+        command = "squeue -a -o %N\t%P\t%M\t%T -h -j {0}".format(passJob).split(' ')
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=False)
+        out, err = process.communicate()
 
-    # Check for invalid IDs or other errors
-    if err: return None
+        # Check for invalid IDs or other errors
+        if err or not out.strip(): 
+            if retInfo: 
+                # If was a previously running job, return old info
+                retInfo['status'] = 'COMPLETE'
+                yield retInfo
+            else: 
+                # Invalid job
+                yield None
+            
+            continue
 
-    # Parse values
-    fields = out.decode('utf-8').rstrip().split("\t")
-    nodes = parseNodes(fields[0])
-  
-    retInfo['id'] = passJob
-    retInfo['nodes'] = nodes
-    retInfo['partition'] = fields[1]
-    retInfo['time'] = fields[2]
-    retInfo['status'] = fields[3]
+        # Valid, running job - parse values
+        fields = out.decode('utf-8').rstrip().split("\t")
+        nodes = parseNodes(fields[0])
+        retInfo['id'] = passJob
+        retInfo['nodes'] = nodes
+        retInfo['partition'] = fields[1]
+        retInfo['time'] = fields[2]
+        retInfo['status'] = fields[3]
 
-    return retInfo
+        yield retInfo
 
-def getStatusBar(passJob, passMonitor):
+def getStatusBar(passSlurm, passMonitor):
     # Obtain latest info
-    slurmInfo = getSlurmInfo(passJob)
+    slurmInfo = next(passSlurm)
     slurmInfo['monitor'] = slurmInfo['nodes'][passMonitor]
 
     columns, rows = shutil.get_terminal_size()
@@ -80,7 +90,7 @@ def getStatusBar(passJob, passMonitor):
 
     return statusText
 
-def renderTop(passScreen, passJob, passNode):
+def renderTop(passScreen, passSlurm, passNode):
     # Break screen into lines
     lines = passScreen.split("\n")
 
@@ -90,13 +100,13 @@ def renderTop(passScreen, passJob, passNode):
     for line in lines[:-1]: sys.stdout.write("{0}\r\n".format(line))
 
     # Render Slurm status bar
-    statusText = getStatusBar(passJob, passNode)
+    statusText = getStatusBar(passSlurm, passNode)
     sys.stdout.write("\x1B[44;37m{0}\x1B[0m".format(statusText))
     sys.stdout.flush()
 
-def processTop(passSlurmInfo, passNode, passPty):
+def processTop(passSlurm, passNode, passPty):
     # Start top process
-    command = "ssh {0} -t top".format(passSlurmInfo['nodes'][passNode]).split(' ')
+    command = "ssh {0} -t top".format(next(passSlurm)['nodes'][passNode]).split(' ')
     process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=passPty)
 
     # Change pty size to match terminal (
@@ -114,29 +124,15 @@ def processTop(passSlurmInfo, passNode, passPty):
         bufParts = buffer.split(HOME_STRING)
         if len(bufParts) > bufSize:
             if passNode == main.monitor:
-                renderTop(bufParts[bufSize - 1], passSlurmInfo['id'], passNode)
+                renderTop(bufParts[bufSize - 1], passSlurm, passNode)
             buffer = ''.join(bufParts[bufSize:])
             if bufSize == 2: bufSize = 1
 
-def processNMon(passSlurmInfo, passNode, passPty):
-    # Start nmon process
-    command = "ssh {0} -t /mnt/lustre/hcgs/anthonyw/bin/nmon".format(passSlurmInfo['nodes'][passNode]).split(' ')
-    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=passPty)
-
-    # Change pty size to match terminal (
-    sizeBuffer = array.array('h', [0, 0, 0, 0])
-    fcntl.ioctl(sys.stdin.fileno(), termios.TIOCGWINSZ, sizeBuffer, True)
-    fcntl.ioctl(passPty, termios.TIOCSWINSZ, sizeBuffer)
-
-    buffer = ''
-    while process.poll() is None:
-        out = process.stdout.read(1)
-        sys.stdout.write(out.decode('utf-8'))
-
 def main(passJob):
     # Obtain info, check for invalid/pending jobs
-    slurmInfo = getSlurmInfo(passJob)
-
+    slurmHandle = getSlurmHandle(passJob)
+    slurmInfo = next(slurmHandle)
+ 
     if not slurmInfo:
         sys.stdout.write("Invalid job ID\r\n")
         return
@@ -153,7 +149,7 @@ def main(passJob):
     for nodeIdx in range(len(slurmInfo['nodes'])):
         # Create pseudo-TTY for this node
         masterPty, slavePty = pty.openpty()
-        thread = Thread(target=processTop, args=(slurmInfo, nodeIdx, slavePty))
+        thread = Thread(target=processTop, args=(slurmHandle, nodeIdx, slavePty))
 
         # Store thread and handle to master pty
         pThreads.append((thread, os.fdopen(masterPty, 'w')))
@@ -178,8 +174,14 @@ def main(passJob):
             main.monitor = (main.monitor - 1) % len(slurmInfo['nodes'])
             key = ' '
 
-        # Write any other keys to top
+        # Check for supported keys
+        if not key in SUPPORTED_KEYS: key = ' '
+
+        # Send keys to top (second space for immediate update, pty requires pause)
         pThreads[main.monitor][1].write(key)
+        pThreads[main.monitor][1].flush()
+        sleep(0.01)
+        pThreads[main.monitor][1].write(' ')
         pThreads[main.monitor][1].flush()
 
     for pThread in pThreads: pThread[0].join()
