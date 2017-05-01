@@ -11,6 +11,7 @@ import pty
 import tty
 import termios
 from threading import Thread
+from threading import Lock
 from time import sleep
 
 HOME_STRING = "\x1B[H"
@@ -19,6 +20,24 @@ CURSORON_STRING = "\x1B[?25h"
 
 SUPPORTED_KEYS = "ABEeltm0123<>RHVJcjxyzbq"
 
+class ThreadIterator:
+    def __init__(self, passIterator):
+        self.iterator = passIterator
+        self.lock = Lock()
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        with self.lock:
+            return next(self.iterator)
+
+def ThreadGenerator(passMethod):
+    def decMethod(*args, **kwargs):
+        return ThreadIterator(passMethod(*args, **kwargs))
+
+    return decMethod
+    
 def debugEsc(passChunk):
     for c in passChunk: 
         if ord(c) == 27: print()
@@ -46,7 +65,8 @@ def parseNodes(passRaw):
                     retNodes.append("{0}{1}".format(nodeBase, idx))
 
     return retNodes
-        
+       
+@ThreadGenerator 
 def getSlurmHandle(passJob):
     retInfo = dict()
 
