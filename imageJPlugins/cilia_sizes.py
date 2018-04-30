@@ -18,8 +18,8 @@ import os
 
 HEADER = "File\tProbability\tIndex\tArea\tPerimeter\tMajor\tMinor\tAngle\tRatio"
 RESULTS_FILE = "results.csv"
-DEFAULT_DIR = "/home/anthonyw/repo_personal/unh/people/ashley_sterpka"
-DEFAULT_TRAIN = "/home/anthonyw/repo_personal/unh/people/ashley_sterpka/cilia.model"
+DEFAULT_DIR = ""
+DEFAULT_TRAIN = ""
 
 def registerWindow(passTitle, passWindows):
 	passWindows.add(passTitle)
